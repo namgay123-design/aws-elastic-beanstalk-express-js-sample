@@ -1,7 +1,6 @@
 pipeline {
   agent any
 
-  // Task 4: timestamps + retention
   options {
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
@@ -19,15 +18,14 @@ pipeline {
     DOCKERHUB = credentials('dockerhub') // Jenkins creds (Username+Password/Token), id: dockerhub
     IMAGE_REPO = "${params.IMAGE_REPO}"
     APP_NAME   = 'aws-elastic-beanstalk-express-js-sample'
-    // Optional speed-up: add Secret Text cred 'nvd_api_key' and append
-    // "--nvdApiKey ${NVD_API_KEY}" to the dependency-check commands.
+    // Optional: NVD API key to speed updates (create Secret Text 'nvd_api_key' then uncomment flags)
     // NVD_API_KEY = credentials('nvd_api_key')
   }
 
   stages {
 
     stage('Build & Test (Node 16)') {
-      agent { docker { image 'node:16-alpine' } } // run Node steps in container
+      agent { docker { image 'node:16-alpine' } }
       steps {
         sh 'node -v && npm -v'
         sh '[ -f package-lock.json ] && npm ci || npm install --save'
@@ -37,20 +35,53 @@ pipeline {
 
     stage('OWASP Dependency-Check (fail on High/Critical)') {
       steps {
-        // Prepare + pull scanner
-        sh 'mkdir -p reports'
-        sh 'docker pull owasp/dependency-check:latest'
+        script {
+          sh "mkdir -p reports"
+          sh "docker pull owasp/dependency-check:latest"
 
-        // ENFORCEMENT RUN: reliable exit code only (no report rendering) with --disableFormat
-        sh 'set +e; docker run --rm -v "$PWD":/src -v dc-data:/usr/share/dependency-check/data owasp/dependency-check:latest --project "aws-elastic-beanstalk-express-js-sample" --scan /src/package.json /src/package-lock.json --failOnCVSS 7 --disableFormat; echo $? > dc.exit; set -e'
+          // ---- Enforcement: run scan, write report INSIDE container to avoid bind-mount issues; read exit code
+          def dcStatus = sh(
+            script: "docker run --rm " +
+                    "-v \"${env.WORKSPACE}\":/src:ro,z " +
+                    "owasp/dependency-check:latest " +
+                    "--project \"${env.APP_NAME}\" " +
+                    "--scan /src/package.json /src/package-lock.json " +
+                    "-f XML -o /tmp/dc.xml " +                 // write inside container (no bind mount)
+                    "--failOnCVSS 7",
+                    // " --nvdApiKey ${env.NVD_API_KEY}"      // uncomment if you set NVD_API_KEY
+            returnStatus: true
+          )
 
-        // BEST-EFFORT REPORTS for evidence (don’t affect pass/fail)
-        sh 'docker run --rm -v "$PWD":/src -v dc-data:/usr/share/dependency-check/data -v "$PWD/reports":/report owasp/dependency-check:latest --noupdate --project "aws-elastic-beanstalk-express-js-sample" --scan /src/package.json /src/package-lock.json --format JSON --out /report --prettyPrint || true'
-        sh 'docker run --rm -v "$PWD":/src -v dc-data:/usr/share/dependency-check/data -v "$PWD/reports":/report owasp/dependency-check:latest --noupdate --project "aws-elastic-beanstalk-express-js-sample" --scan /src/package.json /src/package-lock.json --format HTML --out /report || true'
-        sh 'ls -lah reports || true'
+          // ---- Best-effort human reports to workspace (SELinux-safe :z)
+          sh "docker run --rm " +
+             "-v \"${env.WORKSPACE}\":/src:ro,z " +
+             "-v \"${env.WORKSPACE}/reports\":/report:z " +
+             "owasp/dependency-check:latest " +
+             "--noupdate " +
+             "--project \"${env.APP_NAME}\" " +
+             "--scan /src/package.json /src/package-lock.json " +
+             "-f JSON -o /report --prettyPrint || true"
 
-        // Decide outcome from the enforcement run exit code
-        sh 'code=$(cat dc.exit); if [ "$code" -eq 0 ]; then echo "OWASP DC: No High/Critical (CVSS < 7)."; elif [ "$code" -eq 1 ]; then echo "OWASP DC: High/Critical found (CVSS >= 7)."; exit 1; else echo "OWASP DC: scanner error (exit $code)."; exit $code; fi'
+          sh "docker run --rm " +
+             "-v \"${env.WORKSPACE}\":/src:ro,z " +
+             "-v \"${env.WORKSPACE}/reports\":/report:z " +
+             "owasp/dependency-check:latest " +
+             "--noupdate " +
+             "--project \"${env.APP_NAME}\" " +
+             "--scan /src/package.json /src/package-lock.json " +
+             "-f HTML -o /report || true"
+
+          sh "ls -lah reports || true"
+
+          // ---- Gate on CVSS >= 7
+          if (dcStatus == 1) {
+            error("OWASP DC: High/Critical vulnerabilities detected (CVSS >= 7).")
+          } else if (dcStatus != 0) {
+            error("OWASP DC: scanner error (exit ${dcStatus}).")
+          } else {
+            echo "OWASP DC: No High/Critical detected (CVSS < 7)."
+          }
+        }
       }
       post {
         always {
@@ -79,7 +110,7 @@ pipeline {
   post {
     success {
       echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}"
-      echo "Reports archived under reports/: JSON (robust) and HTML (if generated)."
+      echo "Reports archived under reports/: JSON and HTML (if generated)."
     }
     failure {
       echo 'Build failed. See console log and reports/ artifacts.'
