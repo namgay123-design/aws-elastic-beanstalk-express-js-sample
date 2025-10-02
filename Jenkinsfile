@@ -1,22 +1,24 @@
 pipeline {
   agent any
 
-  options { timestamps(); ansiColor('xterm') }
+  options {
+    timestamps()
+    // Use the build wrapper directly via 'wrap' (works even when ansiColor option isn't available)
+    wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm'])
+  }
 
   parameters {
-    // (Optional) lets you override from the Jenkins UI
     string(name: 'IMAGE_REPO', defaultValue: '22261588namgayrinzin/eb-express-sample', description: 'Docker Hub repo (namespace/name)')
   }
 
   environment {
-    // Jenkins credentials ID must be 'dockerhub' (Username with password/Access Token)
-    DOCKERHUB = credentials('dockerhub')
+    DOCKERHUB = credentials('dockerhub')   // Jenkins creds ID must be 'dockerhub'
     IMAGE_REPO = "${params.IMAGE_REPO}"
   }
 
   stages {
     stage('Build & Test (Node 16)') {
-      agent { docker { image 'node:16' } }
+      agent { docker { image 'node:16' } }   // Node steps in container
       steps {
         sh 'node -v && npm -v'
         sh '''
@@ -27,10 +29,12 @@ pipeline {
           fi
         '''
         sh 'npm test --if-present'
+        // Fail on High/Critical vulns; remove this gate if it’s too strict for now
         sh 'npm audit --production --audit-level=high'
       }
     }
 
+    // Docker runs on the Jenkins agent (must have docker CLI + daemon access)
     stage('Docker Build') {
       steps {
         sh 'docker version'
