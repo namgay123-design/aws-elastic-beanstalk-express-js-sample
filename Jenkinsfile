@@ -15,10 +15,10 @@ pipeline {
   }
 
   environment {
-    DOCKERHUB = credentials('dockerhub') // Jenkins creds (Username+Password/Token), id: dockerhub
+    DOCKERHUB = credentials('dockerhub') // Jenkins creds (Username+Password/Token)
     IMAGE_REPO = "${params.IMAGE_REPO}"
     APP_NAME   = 'aws-elastic-beanstalk-express-js-sample'
-    // Optional: NVD API key to speed updates (create Secret Text 'nvd_api_key' then uncomment flags)
+    // Optional NVD speed-up:
     // NVD_API_KEY = credentials('nvd_api_key')
   }
 
@@ -36,56 +36,62 @@ pipeline {
     stage('OWASP Dependency-Check (fail on High/Critical)') {
       steps {
         script {
-          sh "mkdir -p reports"
-          sh "docker pull owasp/dependency-check:latest"
+          sh 'mkdir -p reports'
+          sh 'docker pull owasp/dependency-check:latest'
 
-          // ---- Enforcement: run scan, write report INSIDE container to avoid bind-mount issues; read exit code
+          // --- Enforcement: update DB into dc-data volume, reliable exit code
           def dcStatus = sh(
-            script: "docker run --rm " +
-                    "-v \"${env.WORKSPACE}\":/src:ro,z " +
-                    "owasp/dependency-check:latest " +
-                    "--project \"${env.APP_NAME}\" " +
-                    "--scan /src/package.json /src/package-lock.json " +
-                    "-f XML -o /tmp/dc.xml " +                 // write inside container (no bind mount)
-                    "--failOnCVSS 7",
-                    // " --nvdApiKey ${env.NVD_API_KEY}"      // uncomment if you set NVD_API_KEY
-            returnStatus: true
+            returnStatus: true,
+            script:
+              'docker run --rm ' +
+              '-v "' + env.WORKSPACE + '":/src:ro,z ' +
+              '-v dc-data:/usr/share/dependency-check/data:z ' + // PERSIST DB
+              'owasp/dependency-check:latest ' +
+              '--project "' + env.APP_NAME + '" ' +
+              '--scan /src/package.json /src/package-lock.json ' +
+              '-f XML -o /tmp/dc.xml ' +          // write inside container
+              '--failOnCVSS 7'
+              // + ' --nvdApiKey ' + env.NVD_API_KEY  // uncomment if configured
           )
 
-          // ---- Best-effort human reports to workspace (SELinux-safe :z)
-          sh "docker run --rm " +
-             "-v \"${env.WORKSPACE}\":/src:ro,z " +
-             "-v \"${env.WORKSPACE}/reports\":/report:z " +
-             "owasp/dependency-check:latest " +
-             "--noupdate " +
-             "--project \"${env.APP_NAME}\" " +
-             "--scan /src/package.json /src/package-lock.json " +
-             "-f JSON -o /report --prettyPrint || true"
+          // --- Human-readable reports, reuse cached DB (fast)
+          sh 'docker run --rm ' +
+             '-v "' + env.WORKSPACE + '":/src:ro,z ' +
+             '-v dc-data:/usr/share/dependency-check/data:z ' +
+             '-v "' + env.WORKSPACE + '/reports":/report:z ' +
+             'owasp/dependency-check:latest ' +
+             '--noupdate ' +
+             '--project "' + env.APP_NAME + '" ' +
+             '--scan /src/package.json /src/package-lock.json ' +
+             '-f JSON -o /report --prettyPrint || true'
 
-          sh "docker run --rm " +
-             "-v \"${env.WORKSPACE}\":/src:ro,z " +
-             "-v \"${env.WORKSPACE}/reports\":/report:z " +
-             "owasp/dependency-check:latest " +
-             "--noupdate " +
-             "--project \"${env.APP_NAME}\" " +
-             "--scan /src/package.json /src/package-lock.json " +
-             "-f HTML -o /report || true"
+          sh 'docker run --rm ' +
+             '-v "' + env.WORKSPACE + '":/src:ro,z ' +
+             '-v dc-data:/usr/share/dependency-check/data:z ' +
+             '-v "' + env.WORKSPACE + '/reports":/report:z ' +
+             'owasp/dependency-check:latest ' +
+             '--noupdate ' +
+             '--project "' + env.APP_NAME + '" ' +
+             '--scan /src/package.json /src/package-lock.json ' +
+             '-f HTML -o /report || true'
 
-          sh "ls -lah reports || true"
+          // Ensure we always have something to archive
+          sh 'ls -lah reports || true'
+          sh 'shopt -s nullglob; files=(reports/*); if [ ${#files[@]} -eq 0 ]; then echo "No report files generated. See console log." > reports/NO_REPORT.txt; fi'
 
-          // ---- Gate on CVSS >= 7
+          // Gate on CVSS >= 7
           if (dcStatus == 1) {
-            error("OWASP DC: High/Critical vulnerabilities detected (CVSS >= 7).")
+            error('OWASP DC: High/Critical vulnerabilities detected (CVSS >= 7).')
           } else if (dcStatus != 0) {
             error("OWASP DC: scanner error (exit ${dcStatus}).")
           } else {
-            echo "OWASP DC: No High/Critical detected (CVSS < 7)."
+            echo 'OWASP DC: No High/Critical detected (CVSS < 7).'
           }
         }
       }
       post {
         always {
-          archiveArtifacts artifacts: 'reports/**', fingerprint: true
+          archiveArtifacts artifacts: 'reports/**', fingerprint: true, allowEmptyArchive: true
         }
       }
     }
