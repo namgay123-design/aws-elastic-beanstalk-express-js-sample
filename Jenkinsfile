@@ -1,93 +1,58 @@
- //Jenkinsfile — Task 3
-// Meets: Node 16 build agent; npm install --save; unit tests; build & push image; dependency scan that fails on High/Critical. 
-// Ref: Assignment Task 3.1 & 3.2.  (Node16 agent, install deps, tests, build/push, security scan & fail criteria)
-
 pipeline {
-  agent {
-    // 3.1(b)(i): Use Node 16 Docker image as build agent
-    docker { image 'node:16' ; args '-v $PWD:/workspace -w /workspace' }
+  agent any
+
+  options { timestamps(); ansiColor('xterm') }
+
+  parameters {
+    // (Optional) lets you override from the Jenkins UI
+    string(name: 'IMAGE_REPO', defaultValue: '22261588namgayrinzin/eb-express-sample', description: 'Docker Hub repo (namespace/name)')
   }
 
   environment {
-    // image name: change YOUR_DH to your Docker Hub username
-    APP_NAME = 'eb-express-sample'
-    DOCKER_IMG = "22261588namgayrinzin/${APP_NAME}"
+    // Jenkins credentials ID must be 'dockerhub' (Username with password/Access Token)
+    DOCKERHUB = credentials('dockerhub')
+    IMAGE_REPO = "${params.IMAGE_REPO}"
   }
 
   stages {
-    stage('Checkout') {
-      steps { checkout scm }
-    }
-
-    stage('Install deps') {
+    stage('Build & Test (Node 16)') {
+      agent { docker { image 'node:16' } }
       steps {
-        // 3.1(b)(ii): npm install --save (assignment wording)
-        sh 'npm install --save'
-      }
-    }
-
-    stage('Unit tests') {
-      steps { sh 'npm test || echo "No tests provided" && true' }
-    }
-
-    // 3.2: Security in the pipeline — choose OWASP DC (no account) and/or Snyk (with token)
-    stage('Dep Scan - OWASP DC (fail CVSS>=7)') {
-      steps {
+        sh 'node -v && npm -v'
         sh '''
-          mkdir -p reports
-          docker run --rm \
-            -v "$PWD":/src \
-            -v "$PWD/reports":/report \
-            owasp/dependency-check:latest \
-            --scan /src \
-            --format "HTML" \
-            --out /report \
-            --failOnCVSS 7
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
         '''
-      }
-      post { always { archiveArtifacts artifacts: 'reports/*.html', fingerprint: true } }
-    }
-
-    stage('Dep Scan - Snyk (fail on high)') {
-      when { expression { return env.SNYK_TOKEN?.trim() } }
-      steps {
-        withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
-          sh '''
-            npm install -g snyk
-            snyk auth "$SNYK_TOKEN"
-            snyk test --severity-threshold=high
-          '''
-        }
+        sh 'npm test --if-present'
+        sh 'npm audit --production --audit-level=high'
       }
     }
 
     stage('Docker Build') {
       steps {
-        sh '''
-          docker build -t ${DOCKER_IMG}:${BUILD_NUMBER} .
-          docker tag ${DOCKER_IMG}:${BUILD_NUMBER} ${DOCKER_IMG}:latest
-        '''
+        sh 'docker version'
+        sh 'docker build -t ${IMAGE_REPO}:${BUILD_NUMBER} -t ${IMAGE_REPO}:latest .'
       }
     }
 
     stage('Docker Push') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-          sh '''
-            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker push ${DOCKER_IMG}:${BUILD_NUMBER}
-            docker push ${DOCKER_IMG}:latest
-            docker logout
-          '''
-        }
+        sh '''
+          echo "${DOCKERHUB_PSW}" | docker login -u "${DOCKERHUB_USR}" --password-stdin
+          docker push ${IMAGE_REPO}:${BUILD_NUMBER}
+          docker push ${IMAGE_REPO}:latest
+          docker logout
+        '''
       }
     }
   }
 
   post {
-    always {
-      // keep scan reports for your PDF evidence
-      archiveArtifacts artifacts: 'reports/*.html', fingerprint: true, allowEmptyArchive: true
-    }
+    success { echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}" }
+    failure { echo 'Build failed.' }
   }
 }
+
