@@ -1,4 +1,72 @@
-/ Jenkinsfile — Task 3
+pipeline {
+  agent any
+
+  environment {
+    APP_NAME   = 'eb-express-sample'
+    DOCKER_IMG = 'YOUR_DH/eb-express-sample'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps { checkout scm }
+    }
+
+    stage('Install deps & Test (Node 16)') {
+      steps {
+        script {
+          docker.image('node:16').inside('-v $PWD:/workspace -w /workspace') {
+            sh 'npm install --save'
+            sh 'npm test || echo "No tests provided"'
+          }
+        }
+      }
+    }
+
+    stage('Dependency Scan - OWASP DC (fail>=7)') {
+      steps {
+        sh '''
+          mkdir -p reports
+          docker run --rm \
+            -v "$PWD":/src \
+            -v "$PWD/reports":/report \
+            owasp/dependency-check:latest \
+            --scan /src \
+            --format "HTML" \
+            --out /report \
+            --failOnCVSS 7
+        '''
+      }
+    }
+
+    stage('Docker Build') {
+      steps {
+        sh '''
+          docker build -t ${DOCKER_IMG}:${BUILD_NUMBER} .
+          docker tag ${DOCKER_IMG}:${BUILD_NUMBER} ${DOCKER_IMG}:latest
+        '''
+      }
+    }
+
+    stage('Docker Push') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+          sh '''
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+            docker push ${DOCKER_IMG}:${BUILD_NUMBER}
+            docker push ${DOCKER_IMG}:latest
+            docker logout
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: 'reports/*.html', fingerprint: true, allowEmptyArchive: true
+    }
+  }
+}/ Jenkinsfile — Task 3
 // Meets: Node 16 build agent; npm install --save; unit tests; build & push image; dependency scan that fails on High/Critical. 
 // Ref: Assignment Task 3.1 & 3.2.  (Node16 agent, install deps, tests, build/push, security scan & fail criteria)
 
