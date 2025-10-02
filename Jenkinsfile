@@ -1,32 +1,29 @@
 pipeline {
   agent any
 
-  // Task 4: logging/retention
   options {
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
+    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20')) // Task 4
   }
 
   parameters {
-    // Set to your Docker Hub repo (you gave: 22261588namgayrinzin/eb-express-sample)
     string(name: 'IMAGE_REPO', defaultValue: '22261588namgayrinzin/eb-express-sample', description: 'Docker Hub repo (namespace/name)')
   }
 
   environment {
-    // Jenkins creds (Username + Password/Token) with ID 'dockerhub'
-    DOCKERHUB = credentials('dockerhub')
+    DOCKERHUB = credentials('dockerhub') // Jenkins creds (Username+Password/Token) id: dockerhub
     IMAGE_REPO = "${params.IMAGE_REPO}"
-    APP_NAME  = 'aws-elastic-beanstalk-express-js-sample'
+    APP_NAME   = 'aws-elastic-beanstalk-express-js-sample'
+    // Optional: set this in Jenkins as a Secret Text credential and switch the line in OWASP stage
+    // NVD_API_KEY = credentials('nvd_api_key')
   }
 
   stages {
 
     stage('Build & Test (Node 16)') {
-      // Task 3.1: Use Node 16 as build agent
       agent { docker { image 'node:16-alpine' } }
       steps {
         sh 'node -v && npm -v'
-        // Per brief: install deps (prefer ci if lock present, else npm install --save)
         sh '''
           if [ -f package-lock.json ]; then
             npm ci
@@ -34,33 +31,31 @@ pipeline {
             npm install --save
           fi
         '''
-        // Will be skipped if no test script exists
         sh 'npm test --if-present'
       }
     }
 
     stage('OWASP Dependency-Check (fail on High/Critical)') {
-      // Task 3.2: Dependency vulnerability scanner
       steps {
         sh '''
           set -eux
           mkdir -p reports
           docker pull owasp/dependency-check:latest
 
-          # Run OWASP DC against the workspace; persist NVD DB in a named volume for speed
+          # Scan only the Node lockfiles; avoid node_modules requirement and noisy warnings
           docker run --rm \
             -v "$PWD":/src \
             -v dc-data:/usr/share/dependency-check/data \
             -v "$PWD/reports":/report \
             owasp/dependency-check:latest \
               --project "${APP_NAME}" \
-              --scan /src \
-              --format "ALL" \
+              --scan /src/package.json /src/package-lock.json \
+              --format HTML \
               --out /report \
-              --failOnCVSS 7 \
-              --enableExperimental
+              --failOnCVSS 7
+              # If you create a Secret Text credential 'nvd_api_key', add:
+              # --nvdApiKey ${NVD_API_KEY}
         '''
-        // Task 4.2: Archive security scan artifacts (visible in build page)
         archiveArtifacts artifacts: 'reports/**', fingerprint: true
       }
     }
@@ -87,10 +82,10 @@ pipeline {
   post {
     success {
       echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}"
-      echo "OWASP Dependency-Check reports archived under 'reports/'."
+      echo "OWASP report archived: reports/dependency-check-report.html"
     }
     failure {
-      echo 'Build failed. Check the OWASP report (reports/dependency-check-report.html) and console log.'
+      echo 'Build failed. See console and reports/dependency-check-report.html'
     }
   }
 }
