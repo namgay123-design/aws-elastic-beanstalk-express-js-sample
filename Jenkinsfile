@@ -16,11 +16,10 @@ pipeline {
   }
 
   environment {
-    // Jenkins credentials (Username + Password/Token) with ID 'dockerhub'
-    DOCKERHUB = credentials('dockerhub')
+    DOCKERHUB = credentials('dockerhub')     // Jenkins creds (Username+Password/Token)
     IMAGE_REPO = "${params.IMAGE_REPO}"
     APP_NAME   = 'aws-elastic-beanstalk-express-js-sample'
-    // Optional speed-up: add a Secret Text cred 'nvd_api_key' and uncomment below + CLI flag
+    // Optional speed-up: add a Secret Text cred 'nvd_api_key' and uncomment flags below
     // NVD_API_KEY = credentials('nvd_api_key')
   }
 
@@ -47,23 +46,35 @@ pipeline {
           mkdir -p reports
           docker pull owasp/dependency-check:latest
 
-          # --- Enforcement run: XML report + gate on CVSS >= 7 ---
+          # -------- Enforcement (reliable). No report, just exit code on CVSS>=7 --------
           set +e
+          docker run --rm \
+            -v "$PWD":/src \
+            -v dc-data:/usr/share/dependency-check/data \
+            owasp/dependency-check:latest \
+              --project "${APP_NAME}" \
+              --scan /src/package.json /src/package-lock.json \
+              --failOnCVSS 7 \
+              --disableFormat
+              # --nvdApiKey ${NVD_API_KEY}   # uncomment if configured
+          DC_EXIT=$?
+          set -e
+
+          # -------- Best-effort reports for humans & evidence (don’t affect gate) --------
+          # JSON first (most robust)
           docker run --rm \
             -v "$PWD":/src \
             -v dc-data:/usr/share/dependency-check/data \
             -v "$PWD/reports":/report \
             owasp/dependency-check:latest \
+              --noupdate \
               --project "${APP_NAME}" \
               --scan /src/package.json /src/package-lock.json \
-              --format XML \
+              --format JSON \
               --out /report \
-              --failOnCVSS 7
-              # --nvdApiKey ${NVD_API_KEY}   # uncomment if you configured NVD_API_KEY
-          DC_EXIT=$?
-          set -e
+              --prettyPrint || true
 
-          # --- Best-effort HTML (for humans). Do not affect gate/exit. ---
+          # HTML next (pretty, can be flaky on some stacks)
           docker run --rm \
             -v "$PWD":/src \
             -v dc-data:/usr/share/dependency-check/data \
@@ -75,7 +86,10 @@ pipeline {
               --format HTML \
               --out /report || true
 
-          # --- Decide outcome based on enforcement run exit code ---
+          # Always show what we produced
+          ls -lah reports || true
+
+          # -------- Decide outcome using enforcement exit code --------
           if [ "$DC_EXIT" -eq 0 ]; then
             echo "OWASP DC: No High/Critical detected (CVSS < 7)."
           elif [ "$DC_EXIT" -eq 1 ]; then
@@ -84,44 +98,4 @@ pipeline {
           else
             echo "OWASP DC: scanner error (exit $DC_EXIT). Failing build."
             exit $DC_EXIT
-          fi
-        '''
-      }
-      post {
-        always {
-          // Task 4: archive reports regardless of pass/fail so the marker can open them
-          archiveArtifacts artifacts: 'reports/**', fingerprint: true
-        }
-      }
-    }
-
-    stage('Docker Build') {
-      steps {
-        sh 'docker version'
-        sh 'docker build -t ${IMAGE_REPO}:${BUILD_NUMBER} -t ${IMAGE_REPO}:latest .'
-      }
-    }
-
-    stage('Docker Push') {
-      steps {
-        sh '''
-          echo "${DOCKERHUB_PSW}" | docker login -u "${DOCKERHUB_USR}" --password-stdin
-          docker push ${IMAGE_REPO}:${BUILD_NUMBER}
-          docker push ${IMAGE_REPO}:latest
-          docker logout
-        '''
-      }
-    }
-  }
-
-  post {
-    success {
-      echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}"
-      echo "Reports archived: reports/dependency-check-report.xml (enforcement), dependency-check-report.html (view)"
-    }
-    failure {
-      echo 'Build failed. See console log and the Dependency-Check reports under artifacts.'
-    }
-  }
-}
 
