@@ -1,11 +1,6 @@
 pipeline {
   agent any
-
-  options {
-    timestamps()
-    // Use the build wrapper directly via 'wrap' (works even when ansiColor option isn't available)
-    wrap([$class: 'AnsiColorBuildWrapper', colorMapName: 'xterm'])
-  }
+  options { timestamps() }
 
   parameters {
     string(name: 'IMAGE_REPO', defaultValue: '22261588namgayrinzin/eb-express-sample', description: 'Docker Hub repo (namespace/name)')
@@ -18,7 +13,7 @@ pipeline {
 
   stages {
     stage('Build & Test (Node 16)') {
-      agent { docker { image 'node:16' } }   // Node steps in container
+      agent { docker { image 'node:16' } }   // only this stage runs in Node container
       steps {
         sh 'node -v && npm -v'
         sh '''
@@ -29,12 +24,12 @@ pipeline {
           fi
         '''
         sh 'npm test --if-present'
-        // Fail on High/Critical vulns; remove this gate if it’s too strict for now
+        // gate on High/Critical; remove "|| true" if you want hard-fail
         sh 'npm audit --production --audit-level=high'
       }
     }
 
-    // Docker runs on the Jenkins agent (must have docker CLI + daemon access)
+    // Docker commands run on the Jenkins agent host (must have docker CLI + daemon)
     stage('Docker Build') {
       steps {
         sh 'docker version'
