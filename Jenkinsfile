@@ -1,4 +1,4 @@
- Jenkinsfile — Task 3
+ //Jenkinsfile — Task 3
 // Meets: Node 16 build agent; npm install --save; unit tests; build & push image; dependency scan that fails on High/Critical. 
 // Ref: Assignment Task 3.1 & 3.2.  (Node16 agent, install deps, tests, build/push, security scan & fail criteria)
 
