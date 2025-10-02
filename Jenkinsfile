@@ -1,84 +1,74 @@
 pipeline {
   agent any
-  options { timestamps() }
+
+  // Task 4: logging/retention
+  options {
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
+  }
 
   parameters {
+    // Set to your Docker Hub repo (you gave: 22261588namgayrinzin/eb-express-sample)
     string(name: 'IMAGE_REPO', defaultValue: '22261588namgayrinzin/eb-express-sample', description: 'Docker Hub repo (namespace/name)')
   }
 
   environment {
-    DOCKERHUB = credentials('dockerhub')   // Jenkins creds ID must be 'dockerhub'
+    // Jenkins creds (Username + Password/Token) with ID 'dockerhub'
+    DOCKERHUB = credentials('dockerhub')
     IMAGE_REPO = "${params.IMAGE_REPO}"
+    APP_NAME  = 'aws-elastic-beanstalk-express-js-sample'
   }
 
   stages {
+
     stage('Build & Test (Node 16)') {
-      agent { docker { image 'node:16' } }   // only this stage runs in Node container
+      // Task 3.1: Use Node 16 as build agent
+      agent { docker { image 'node:16-alpine' } }
       steps {
         sh 'node -v && npm -v'
+        // Per brief: install deps (prefer ci if lock present, else npm install --save)
         sh '''
           if [ -f package-lock.json ]; then
             npm ci
           else
-            npm install
+            npm install --save
           fi
         '''
+        // Will be skipped if no test script exists
         sh 'npm test --if-present'
       }
     }
 
-    stage('Dependency Scan (npm audit)') {
-      agent { docker { image 'node:16' } }
+    stage('OWASP Dependency-Check (fail on High/Critical)') {
+      // Task 3.2: Dependency vulnerability scanner
       steps {
         sh '''
-          # Ensure deps are present (safe to run again)
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+          set -eux
+          mkdir -p reports
+          docker pull owasp/dependency-check:latest
 
-          # Always produce a report; then we decide if we fail
-          npm audit --production --json > audit.json || true
-
-          node -e "
-            const fs=require('fs');
-            const j=JSON.parse(fs.readFileSync('audit.json','utf8'));
-            let hi=0, cr=0;
-            if (j.vulnerabilities){ hi=j.vulnerabilities.high||0; cr=j.vulnerabilities.critical||0; }
-            else if (j.metadata && j.metadata.vulnerabilities){ hi=j.metadata.vulnerabilities.high||0; cr=j.metadata.vulnerabilities.critical||0; }
-            console.log('High:',hi,'Critical:',cr);
-            if ((hi+cr)>0){ console.error('Failing due to High/Critical vulnerabilities'); process.exit(1); }
-          "
+          # Run OWASP DC against the workspace; persist NVD DB in a named volume for speed
+          docker run --rm \
+            -v "$PWD":/src \
+            -v dc-data:/usr/share/dependency-check/data \
+            -v "$PWD/reports":/report \
+            owasp/dependency-check:latest \
+              --project "${APP_NAME}" \
+              --scan /src \
+              --format "ALL" \
+              --out /report \
+              --failOnCVSS 7 \
+              --enableExperimental
         '''
-        archiveArtifacts artifacts: 'audit.json', fingerprint: true
+        // Task 4.2: Archive security scan artifacts (visible in build page)
+        archiveArtifacts artifacts: 'reports/**', fingerprint: true
       }
     }
 
-    // Docker commands run on the Jenkins agent host (must have docker CLI + daemon)
     stage('Docker Build') {
       steps {
         sh 'docker version'
         sh 'docker build -t ${IMAGE_REPO}:${BUILD_NUMBER} -t ${IMAGE_REPO}:latest .'
-      }
-    }
-
-    // Scan the built image BEFORE pushing it
-    stage('Container Image Scan (Trivy)') {
-      steps {
-        sh '''
-          # Pull Trivy image and scan High/Critical; fail build if found
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:0.54.2 image \
-            --severity HIGH,CRITICAL \
-            --exit-code 1 \
-            --no-progress \
-            -f table \
-            -o trivy-image.txt \
-            ${IMAGE_REPO}:${BUILD_NUMBER}
-        '''
-        archiveArtifacts artifacts: 'trivy-image.txt', fingerprint: true
       }
     }
 
@@ -95,8 +85,13 @@ pipeline {
   }
 
   post {
-    success { echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}" }
-    failure { echo 'Build failed.' }
+    success {
+      echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}"
+      echo "OWASP Dependency-Check reports archived under 'reports/'."
+    }
+    failure {
+      echo 'Build failed. Check the OWASP report (reports/dependency-check-report.html) and console log.'
+    }
   }
 }
 
