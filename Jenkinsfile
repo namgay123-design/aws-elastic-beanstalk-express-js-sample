@@ -1,25 +1,18 @@
 pipeline {
   agent any
-
-  options {
-    timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
-  }
+  options { timestamps() }
 
   parameters {
-    string(
-      name: 'IMAGE_REPO',
-      defaultValue: '22261588namgayrinzin/eb-express-sample',
-      description: 'Docker Hub repo (namespace/name)'
-    )
+    string(name: 'IMAGE_REPO',
+           defaultValue: '22261588namgayrinzin/eb-express-sample',
+           description: 'Docker Hub repo (namespace/name)')
+    booleanParam(name: 'USE_NVD_KEY',
+                 defaultValue: false,
+                 description: 'Use Jenkins Secret Text (ID: NVD_API_KEY) to speed Dependency-Check updates')
   }
 
   environment {
-    DOCKERHUB = credentials('dockerhub') // Jenkins creds (Username+Password/Token)
     IMAGE_REPO = "${params.IMAGE_REPO}"
-    APP_NAME   = 'aws-elastic-beanstalk-express-js-sample'
-    // Optional NVD speed-up:
-    // NVD_API_KEY = credentials('nvd_api_key')
   }
 
   stages {
@@ -28,7 +21,14 @@ pipeline {
       agent { docker { image 'node:16-alpine' } }
       steps {
         sh 'node -v && npm -v'
-        sh '[ -f package-lock.json ] && npm ci || npm install --save'
+        sh '''
+          set -eux
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+        '''
         sh 'npm test --if-present'
       }
     }
@@ -36,62 +36,101 @@ pipeline {
     stage('OWASP Dependency-Check (fail on High/Critical)') {
       steps {
         script {
-          sh 'mkdir -p reports'
-          sh 'docker pull owasp/dependency-check:latest'
+          // Prepare reports dir
+          sh '''
+            set -eux
+            mkdir -p reports
+            rm -f reports/*
+          '''
 
-          // --- Enforcement: update DB into dc-data volume, reliable exit code
-          def dcStatus = sh(
-            returnStatus: true,
-            script:
-              'docker run --rm ' +
-              '-v "' + env.WORKSPACE + '":/src:ro,z ' +
-              '-v dc-data:/usr/share/dependency-check/data:z ' + // PERSIST DB
-              'owasp/dependency-check:latest ' +
-              '--project "' + env.APP_NAME + '" ' +
-              '--scan /src/package.json /src/package-lock.json ' +
-              '-f XML -o /tmp/dc.xml ' +          // write inside container
-              '--failOnCVSS 7'
-              // + ' --nvdApiKey ' + env.NVD_API_KEY  // uncomment if configured
-          )
+          // Reusable shell body that:
+          // 1) seeds/updates DC DB (XML output to container /tmp, captures exit code)
+          // 2) writes JSON + HTML reports into container /tmp and copies to ./reports
+          def scanScript = '''
+            set -eux
 
-          // --- Human-readable reports, reuse cached DB (fast)
-          sh 'docker run --rm ' +
-             '-v "' + env.WORKSPACE + '":/src:ro,z ' +
-             '-v dc-data:/usr/share/dependency-check/data:z ' +
-             '-v "' + env.WORKSPACE + '/reports":/report:z ' +
-             'owasp/dependency-check:latest ' +
-             '--noupdate ' +
-             '--project "' + env.APP_NAME + '" ' +
-             '--scan /src/package.json /src/package-lock.json ' +
-             '-f JSON -o /report --prettyPrint || true'
+            # Compose optional NVD API flag if variable is present
+            NVD_OPT=""
+            if [ "${USE_NVD_KEY:-false}" = "true" ] && [ -n "${NVD_API_KEY:-}" ]; then
+              NVD_OPT="--nvdApiKey ${NVD_API_KEY}"
+            fi
 
-          sh 'docker run --rm ' +
-             '-v "' + env.WORKSPACE + '":/src:ro,z ' +
-             '-v dc-data:/usr/share/dependency-check/data:z ' +
-             '-v "' + env.WORKSPACE + '/reports":/report:z ' +
-             'owasp/dependency-check:latest ' +
-             '--noupdate ' +
-             '--project "' + env.APP_NAME + '" ' +
-             '--scan /src/package.json /src/package-lock.json ' +
-             '-f HTML -o /report || true'
+            # 1) Seed/update DB and gate on CVSS >= 7
+            CID=$(docker create --rm \
+              -v "$WORKSPACE":/src:ro,z \
+              -v dc-data:/usr/share/dependency-check/data:z \
+              owasp/dependency-check:latest \
+              --project "aws-elastic-beanstalk-express-js-sample" \
+              --scan /src/package.json /src/package-lock.json \
+              -f XML -o /tmp \
+              --failOnCVSS 7 ${NVD_OPT})
 
-          // Ensure we always have something to archive
-          sh 'ls -lah reports || true'
-          sh 'shopt -s nullglob; files=(reports/*); if [ ${#files[@]} -eq 0 ]; then echo "No report files generated. See console log." > reports/NO_REPORT.txt; fi'
+            set +e
+            docker start -a "$CID"
+            DC_EXIT=$?
+            set -e
 
-          // Gate on CVSS >= 7
-          if (dcStatus == 1) {
-            error('OWASP DC: High/Critical vulnerabilities detected (CVSS >= 7).')
-          } else if (dcStatus != 0) {
-            error("OWASP DC: scanner error (exit ${dcStatus}).")
+            # Copy XML report out (if it exists)
+            docker cp "$CID":/tmp/dependency-check-report.xml reports/dependency-check-report.xml 2>/dev/null || true
+            docker rm -f "$CID" >/dev/null 2>&1 || true
+
+            # 2) Create JSON report (reusing DB, no update)
+            CID_J=$(docker create --rm \
+              -v "$WORKSPACE":/src:ro,z \
+              -v dc-data:/usr/share/dependency-check/data:z \
+              owasp/dependency-check:latest \
+              --noupdate \
+              --project "aws-elastic-beanstalk-express-js-sample" \
+              --scan /src/package.json /src/package-lock.json \
+              -f JSON -o /tmp --prettyPrint)
+            docker start -a "$CID_J" || true
+            docker cp "$CID_J":/tmp/dependency-check-report.json reports/dependency-check-report.json 2>/dev/null || true
+            docker rm -f "$CID_J" >/dev/null 2>&1 || true
+
+            # 3) Create HTML report (reusing DB, no update)
+            CID_H=$(docker create --rm \
+              -v "$WORKSPACE":/src:ro,z \
+              -v dc-data:/usr/share/dependency-check/data:z \
+              owasp/dependency-check:latest \
+              --noupdate \
+              --project "aws-elastic-beanstalk-express-js-sample" \
+              --scan /src/package.json /src/package-lock.json \
+              -f HTML -o /tmp)
+            docker start -a "$CID_H" || true
+            docker cp "$CID_H":/tmp/dependency-check-report.html reports/dependency-check-report.html 2>/dev/null || true
+            docker rm -f "$CID_H" >/dev/null 2>&1 || true
+
+            echo "$DC_EXIT" > reports/dc.exit
+            exit "$DC_EXIT"
+          '''
+
+          int dcExit = 0
+          if (params.USE_NVD_KEY) {
+            withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_API_KEY')]) {
+              // pass the toggle to the shell as well
+              withEnv(["USE_NVD_KEY=true"]) {
+                dcExit = sh(returnStatus: true, script: scanScript)
+              }
+            }
           } else {
-            echo 'OWASP DC: No High/Critical detected (CVSS < 7).'
+            withEnv(["USE_NVD_KEY=false"]) {
+              dcExit = sh(returnStatus: true, script: scanScript)
+            }
+          }
+
+          // Decide build result from exit code
+          if (dcExit == 1) {
+            error "OWASP Dependency-Check: High/Critical vulnerabilities found (CVSS >= 7). See reports/."
+          } else if (dcExit != 0) {
+            error "OWASP Dependency-Check: scanner error (exit ${dcExit}). See console log."
+          } else {
+            echo "OWASP DC: No High/Critical detected (CVSS < 7)."
           }
         }
       }
       post {
         always {
-          archiveArtifacts artifacts: 'reports/**', fingerprint: true, allowEmptyArchive: true
+          archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true, fingerprint: true
         }
       }
     }
@@ -105,22 +144,23 @@ pipeline {
 
     stage('Docker Push') {
       steps {
-        sh 'echo "${DOCKERHUB_PSW}" | docker login -u "${DOCKERHUB_USR}" --password-stdin'
-        sh 'docker push ${IMAGE_REPO}:${BUILD_NUMBER}'
-        sh 'docker push ${IMAGE_REPO}:latest'
-        sh 'docker logout'
+        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKERHUB_USR', passwordVariable: 'DOCKERHUB_PSW')]) {
+          sh '''
+            set -eux
+            echo "${DOCKERHUB_PSW}" | docker login -u "${DOCKERHUB_USR}" --password-stdin
+            docker push ${IMAGE_REPO}:${BUILD_NUMBER}
+            docker push ${IMAGE_REPO}:latest
+            docker logout
+          '''
+        }
       }
     }
   }
 
   post {
-    success {
-      echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}"
-      echo "Reports archived under reports/: JSON and HTML (if generated)."
-    }
-    failure {
-      echo 'Build failed. See console log and reports/ artifacts.'
-    }
+    success { echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}" }
+    failure { echo 'Build failed. See console and the reports/ artifacts if produced.' }
+    always  { echo 'Pipeline finished.' }
   }
 }
 
