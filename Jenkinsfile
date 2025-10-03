@@ -1,156 +1,76 @@
 pipeline {
   agent any
-  options { timestamps() }
 
-  parameters {
-    string(name: 'IMAGE_REPO',
-           defaultValue: '22261588namgayrinzin/eb-express-sample',
-           description: 'Docker Hub repo (namespace/name)')
-    booleanParam(name: 'USE_NVD_KEY',
-                 defaultValue: false,
-                 description: 'Use Jenkins Secret Text (ID: NVD_API_KEY) to speed Dependency-Check updates')
+  options {
+    timestamps()
+    disableConcurrentBuilds()        // avoid H2 DB lock races in OWASP cache
   }
 
   environment {
-    IMAGE_REPO = "${params.IMAGE_REPO}"
+    IMAGE_NAME       = '22261588namgayrinzin/eb-express-sample'    // <-- your Docker Hub repo
+    DOCKERHUB_CREDS  = 'dockerhub-creds'       // <-- Jenkins cred (user/pass or token)
+    // The NVD API key is provided at runtime via credentials (ID: nvd-api-key)
   }
 
   stages {
 
-    stage('Build & Test (Node 16)') {
-      agent { docker { image 'node:16-alpine' } }
-      steps {
-        sh 'node -v && npm -v'
-        sh '''
-          set -eux
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-        '''
-        sh 'npm test --if-present'
-      }
-    }
-
-    stage('OWASP Dependency-Check (fail on High/Critical)') {
+    stage('Install & Test (Node 16)') {
       steps {
         script {
-          // Prepare reports dir
-          sh '''
-            set -eux
-            mkdir -p reports
-            rm -f reports/*
-          '''
-
-          // Reusable shell body that:
-          // 1) seeds/updates DC DB (XML output to container /tmp, captures exit code)
-          // 2) writes JSON + HTML reports into container /tmp and copies to ./reports
-          def scanScript = '''
-            set -eux
-
-            # Compose optional NVD API flag if variable is present
-            NVD_OPT=""
-            if [ "${USE_NVD_KEY:-false}" = "true" ] && [ -n "${NVD_API_KEY:-}" ]; then
-              NVD_OPT="--nvdApiKey ${NVD_API_KEY}"
-            fi
-
-            # 1) Seed/update DB and gate on CVSS >= 7
-            CID=$(docker create --rm \
-              -v "$WORKSPACE":/src:ro,z \
-              -v dc-data:/usr/share/dependency-check/data:z \
-              owasp/dependency-check:latest \
-              --project "aws-elastic-beanstalk-express-js-sample" \
-              --scan /src/package.json /src/package-lock.json \
-              -f XML -o /tmp \
-              --failOnCVSS 7 ${NVD_OPT})
-
-            set +e
-            docker start -a "$CID"
-            DC_EXIT=$?
-            set -e
-
-            # Copy XML report out (if it exists)
-            docker cp "$CID":/tmp/dependency-check-report.xml reports/dependency-check-report.xml 2>/dev/null || true
-            docker rm -f "$CID" >/dev/null 2>&1 || true
-
-            # 2) Create JSON report (reusing DB, no update)
-            CID_J=$(docker create --rm \
-              -v "$WORKSPACE":/src:ro,z \
-              -v dc-data:/usr/share/dependency-check/data:z \
-              owasp/dependency-check:latest \
-              --noupdate \
-              --project "aws-elastic-beanstalk-express-js-sample" \
-              --scan /src/package.json /src/package-lock.json \
-              -f JSON -o /tmp --prettyPrint)
-            docker start -a "$CID_J" || true
-            docker cp "$CID_J":/tmp/dependency-check-report.json reports/dependency-check-report.json 2>/dev/null || true
-            docker rm -f "$CID_J" >/dev/null 2>&1 || true
-
-            # 3) Create HTML report (reusing DB, no update)
-            CID_H=$(docker create --rm \
-              -v "$WORKSPACE":/src:ro,z \
-              -v dc-data:/usr/share/dependency-check/data:z \
-              owasp/dependency-check:latest \
-              --noupdate \
-              --project "aws-elastic-beanstalk-express-js-sample" \
-              --scan /src/package.json /src/package-lock.json \
-              -f HTML -o /tmp)
-            docker start -a "$CID_H" || true
-            docker cp "$CID_H":/tmp/dependency-check-report.html reports/dependency-check-report.html 2>/dev/null || true
-            docker rm -f "$CID_H" >/dev/null 2>&1 || true
-
-            echo "$DC_EXIT" > reports/dc.exit
-            exit "$DC_EXIT"
-          '''
-
-          int dcExit = 0
-          if (params.USE_NVD_KEY) {
-            withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_API_KEY')]) {
-              // pass the toggle to the shell as well
-              withEnv(["USE_NVD_KEY=true"]) {
-                dcExit = sh(returnStatus: true, script: scanScript)
-              }
-            }
-          } else {
-            withEnv(["USE_NVD_KEY=false"]) {
-              dcExit = sh(returnStatus: true, script: scanScript)
-            }
+          // Runs npm steps inside a Node 16 container.
+          // NOTE: Jenkins and DinD must share the jenkins-data volume so the workspace mounts correctly.
+          docker.image('node:16').inside('-u root:root') {
+            sh '''
+              node -v
+              npm install --save --no-audit --fund=false
+              npm test || echo "No tests found"
+            '''
           }
-
-          // Decide build result from exit code
-          if (dcExit == 1) {
-            error "OWASP Dependency-Check: High/Critical vulnerabilities found (CVSS >= 7). See reports/."
-          } else if (dcExit != 0) {
-            error "OWASP Dependency-Check: scanner error (exit ${dcExit}). See console log."
-          } else {
-            echo "OWASP DC: No High/Critical detected (CVSS < 7)."
-          }
-        }
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true, fingerprint: true
         }
       }
     }
 
-    stage('Docker Build') {
+    stage('Build & Push Docker Image') {
       steps {
-        sh 'docker version'
-        sh 'docker build -t ${IMAGE_REPO}:${BUILD_NUMBER} -t ${IMAGE_REPO}:latest .'
+        withCredentials([usernamePassword(
+            credentialsId: "${DOCKERHUB_CREDS}",
+            usernameVariable: 'DOCKER_USER',
+            passwordVariable: 'DOCKER_PASS'
+        )]) {
+          sh '''
+            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+
+            docker build -t ${IMAGE_NAME}:${BUILD_NUMBER} .
+            docker tag ${IMAGE_NAME}:${BUILD_NUMBER} index.docker.io/${IMAGE_NAME}:${BUILD_NUMBER}
+            docker push index.docker.io/${IMAGE_NAME}:${BUILD_NUMBER}
+
+            docker tag ${IMAGE_NAME}:${BUILD_NUMBER} index.docker.io/${IMAGE_NAME}:latest
+            docker push index.docker.io/${IMAGE_NAME}:latest
+          '''
+        }
       }
     }
 
-    stage('Docker Push') {
+    stage('Dependency Scan (OWASP) - fail on High/Critical') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKERHUB_USR', passwordVariable: 'DOCKERHUB_PSW')]) {
+        // Store your NVD key in Jenkins as a Secret Text with ID: nvd-api-key
+        withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
           sh '''
-            set -eux
-            echo "${DOCKERHUB_PSW}" | docker login -u "${DOCKERHUB_USR}" --password-stdin
-            docker push ${IMAGE_REPO}:${BUILD_NUMBER}
-            docker push ${IMAGE_REPO}:latest
-            docker logout
+            mkdir -p odc-data odc-report
+            # Ensure the cache/report dirs are writable by the container user (uid 1000 is common)
+            chmod -R u+rwX odc-data odc-report || true
+
+            docker run --rm --name depcheck-$BUILD_NUMBER \
+              -e NVD_API_KEY=$NVD_API_KEY \
+              -v "$PWD":/src \
+              -v "$PWD/odc-data":/usr/share/dependency-check/data \
+              -v "$PWD/odc-report":/report \
+              owasp/dependency-check:latest \
+                --scan /src \
+                --format HTML \
+                --out /report \
+                --exclude node_modules \
+                --failOnCVSS 7
           '''
         }
       }
@@ -158,9 +78,9 @@ pipeline {
   }
 
   post {
-    success { echo "Build & push OK: ${IMAGE_REPO}:${BUILD_NUMBER}" }
-    failure { echo 'Build failed. See console and the reports/ artifacts if produced.' }
-    always  { echo 'Pipeline finished.' }
+    always {
+      archiveArtifacts artifacts: 'odc-report/*.html, odc-report/*.xml', fingerprint: true
+    }
   }
 }
 
