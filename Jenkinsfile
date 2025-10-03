@@ -3,14 +3,13 @@ pipeline {
 
   options {
     timestamps()
-    disableConcurrentBuilds()        // avoid H2 DB lock races in OWASP cache
+    disableConcurrentBuilds() // avoid H2 DB lock races in OWASP cache
   }
 
   environment {
-    // === YOUR SETTINGS ===
     IMAGE_NAME      = '22261588namgayrinzin/eb-express-sample' // your Docker Hub repo
     DOCKERHUB_CREDS = 'dockerhub'                              // your Jenkins credential ID
-    // (Optional) NVD API key via Jenkins Secret Text ID: nvd-api-key
+    // Optional: add a Secret Text in Jenkins with ID 'nvd-api-key' for much faster updates
   }
 
   stages {
@@ -18,7 +17,6 @@ pipeline {
     stage('Install & Test (Node 16)') {
       steps {
         script {
-          // run npm steps inside Node 16 container
           docker.image('node:16').inside('-u root:root') {
             sh '''
               set -eux
@@ -54,15 +52,15 @@ pipeline {
       }
     }
 
-    stage('Dependency Scan (OWASP) - fail on High/Critical') {
+    stage('Dependency Scan (OWASP) - fast') {
       steps {
         script {
-          // Make the NVD API key optional: use it if present, otherwise continue without it
+          // Try to use NVD API key if configured
           def NVD_ENV = ''
           try {
             withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
               if (env.NVD_API_KEY?.trim()) {
-                echo 'Using NVD API key for faster CVE DB updates.'
+                echo 'Using NVD API key for faster NVD updates.'
                 NVD_ENV = "-e NVD_API_KEY=${env.NVD_API_KEY}"
               }
             }
@@ -70,9 +68,27 @@ pipeline {
             echo "NVD API key credential 'nvd-api-key' not configured. Continuing without it."
           }
 
+          // Decide if we can skip updates (cache fresh within 24h)
+          def NOUPDATE = ''
+          sh 'mkdir -p odc-data odc-report'
+          def cacheFresh = sh(
+            script: 'if find odc-data -type f -mtime -1 | grep -q .; then echo fresh; else echo stale; fi',
+            returnStdout: true
+          ).trim()
+          if (cacheFresh == 'fresh') {
+            NOUPDATE = '--noupdate'
+            echo "ODC cache looks fresh; scanning with --noupdate."
+          } else {
+            echo "ODC cache stale or empty; will update CVE DB this run."
+          }
+
+          // Pre-pull to avoid first-run delay
+          sh 'docker pull owasp/dependency-check:latest || true'
+
+          // FAST scan: only the manifests (package.json + package-lock.json)
+          // This still resolves/transitively analyzes dependencies via the lock file.
           sh """
             set -eux
-            mkdir -p odc-data odc-report
             chmod -R u+rwX odc-data odc-report || true
 
             docker run --rm --name depcheck-${BUILD_NUMBER} \
@@ -81,10 +97,10 @@ pipeline {
               -v "\$PWD/odc-data":/usr/share/dependency-check/data \
               -v "\$PWD/odc-report":/report \
               owasp/dependency-check:latest \
-                --scan /src \
+                ${NOUPDATE} \
+                --scan /src/package.json /src/package-lock.json \
                 --format HTML \
                 --out /report \
-                --exclude node_modules \
                 --prettyPrint \
                 --failOnCVSS 7
           """
@@ -101,7 +117,7 @@ pipeline {
       // keep reports with the build
       archiveArtifacts artifacts: 'odc-report/**', fingerprint: true, allowEmptyArchive: false
 
-      // nice clickable HTML link (install "HTML Publisher" plugin)
+      // clickable HTML link (requires "HTML Publisher" plugin)
       script {
         if (fileExists('odc-report/dependency-check-report.html')) {
           try {
